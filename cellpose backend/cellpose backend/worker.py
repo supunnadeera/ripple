@@ -9,6 +9,9 @@ import base64
 from io import BytesIO
 from PIL import Image
 from pathlib import Path
+import platform
+import shutil
+import tempfile
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -23,6 +26,38 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 CELLPOSE_31_DIR = os.path.join(MODELS_DIR, "Cellpose 3.1")
 CELLPOSE_SAM_DIR = os.path.join(MODELS_DIR, "CellposeSAM")
+
+
+def get_short_path_name(long_path):
+    """
+    Convert Windows long path with spaces to short path (8.3 format).
+    This fixes PyTorch file reader issues with paths containing spaces.
+    Returns the original path on non-Windows systems or if conversion fails.
+    """
+    if platform.system() != 'Windows':
+        return long_path
+    
+    try:
+        import ctypes
+        from ctypes import wintypes
+        
+        _GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        _GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        _GetShortPathNameW.restype = wintypes.DWORD
+        
+        output_buf_size = 0
+        while True:
+            output_buf = ctypes.create_unicode_buffer(output_buf_size)
+            needed = _GetShortPathNameW(long_path, output_buf, output_buf_size)
+            if output_buf_size >= needed:
+                short_path = output_buf.value
+                logger.info(f"🔄 Converted path: {long_path} -> {short_path}")
+                return short_path
+            else:
+                output_buf_size = needed
+    except Exception as e:
+        logger.warning(f"⚠️ Could not convert to short path: {e}. Using original path.")
+        return long_path
 
 
 def main():
@@ -69,6 +104,27 @@ def main():
     # Normalize path to absolute path (handles Windows paths better)
     model_path = os.path.abspath(model_path)
     
+    # Fix for Windows paths with spaces - PyTorch C++ loader can't handle them
+    # Create a temporary copy without spaces in the path
+    temp_model_path = None
+    if platform.system() == 'Windows' and ' ' in model_path and args.model_name not in ['cyto3', 'cpsam']:
+        try:
+            # Create temp file in a directory without spaces
+            temp_dir = tempfile.gettempdir()  # Usually C:\Users\user\AppData\Local\Temp
+            temp_model_path = os.path.join(temp_dir, f"cellpose_model_{os.getpid()}.tmp")
+            logger.info(f"🔄 Creating temporary model copy to avoid path space issue:")
+            logger.info(f"   Original: {model_path}")
+            logger.info(f"   Temp: {temp_model_path}")
+            shutil.copy2(model_path, temp_model_path)
+            model_path = temp_model_path
+        except Exception as e:
+            logger.warning(f"⚠️ Could not create temp copy: {e}. Using original path.")
+            # Convert to forward slashes as fallback
+            model_path = model_path.replace('\\', '/')
+    elif platform.system() == 'Windows':
+        # Even without spaces, use forward slashes on Windows for PyTorch
+        model_path = model_path.replace('\\', '/')
+    
     logger.info(f"📍 Model path: {model_path}")
     
     # 2. VERIFY MODEL EXISTS (skip for built-in models)
@@ -84,24 +140,29 @@ def main():
         from cellpose import models, utils
 
         # 2. LOAD IMAGE
-        logger.info(f"📂 Attempting to load image from: {args.image}")
-        logger.info(f"   File exists: {os.path.exists(args.image)}")
-        if os.path.exists(args.image):
-            logger.info(f"   File size: {os.path.getsize(args.image)} bytes")
-            logger.info(f"   Absolute path: {os.path.abspath(args.image)}")
+        # Fix Windows paths with spaces for image path too
+        image_path = args.image
+        if platform.system() == 'Windows':
+            image_path = os.path.abspath(image_path).replace('\\', '/')
+        
+        logger.info(f"📂 Attempting to load image from: {image_path}")
+        logger.info(f"   File exists: {os.path.exists(image_path)}")
+        if os.path.exists(image_path):
+            logger.info(f"   File size: {os.path.getsize(image_path)} bytes")
+            logger.info(f"   Absolute path: {os.path.abspath(image_path)}")
         
         # Note: cv2 loads as BGR. Cellpose generally expects RGB.
-        img = cv2.imread(args.image, cv2.IMREAD_UNCHANGED)
+        img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
         if img is None:
             # Try alternative loading method using PIL
             logger.warning("⚠️ cv2.imread failed, trying PIL.Image.open...")
             try:
-                pil_img = Image.open(args.image)
+                pil_img = Image.open(image_path)
                 img = np.array(pil_img)
                 logger.info(f"✓ Successfully loaded image with PIL: shape {img.shape}")
             except Exception as pil_error:
                 logger.error(f"❌ PIL also failed: {pil_error}")
-                raise ValueError(f"Could not read image file: {args.image}\nFile exists: {os.path.exists(args.image)}\nError: cv2.imread returned None")
+                raise ValueError(f"Could not read image file: {image_path}\nFile exists: {os.path.exists(image_path)}\nError: cv2.imread returned None")
 
         # Ensure image has 3 dimensions (H, W, C) if it's color
         # If grayscale (H, W), add channel dim -> (H, W, 1)
@@ -266,6 +327,15 @@ def main():
     except Exception as e:
         logger.error(f"💥 Error occurred: {e}", exc_info=True)
         print(json.dumps({"status": "error", "message": str(e)}))
+    
+    finally:
+        # Clean up temporary model file if created
+        if temp_model_path and os.path.exists(temp_model_path):
+            try:
+                os.remove(temp_model_path)
+                logger.info(f"🗑️ Cleaned up temporary model file: {temp_model_path}")
+            except Exception as cleanup_error:
+                logger.warning(f"⚠️ Could not remove temp file: {cleanup_error}")
 
 
 if __name__ == "__main__":
